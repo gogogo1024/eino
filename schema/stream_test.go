@@ -573,3 +573,190 @@ func TestMultiStream(t *testing.T) {
 		t.Fatal("end stream haven't return EOF")
 	}
 }
+
+// 微型例子：两个子 reader 读取同一上游的第一个元素，应当拿到完全相同的值，且后续序列一致。
+func TestCopyFirstElementSharedBetweenTwoChildren(t *testing.T) {
+	s := newStream[int](0)
+	copies := s.asReader().Copy(2)
+
+	defer func() {
+		for _, cp := range copies {
+			cp.Close()
+		}
+	}()
+
+	// 上游依次产生 1、2
+	go func() {
+		s.send(1, nil)
+		time.Sleep(20 * time.Millisecond)
+		s.send(2, nil)
+		s.closeSend()
+	}()
+
+	// 子0先读到第一个元素
+	v0a, err := copies[0].Recv()
+	assert.NoError(t, err)
+	assert.Equal(t, 1, v0a)
+
+	// 稍后子1再来读第一个元素，也应拿到相同的值
+	time.Sleep(5 * time.Millisecond)
+	v1a, err := copies[1].Recv()
+	assert.NoError(t, err)
+	assert.Equal(t, 1, v1a)
+
+	// 继续各自读取下一个位置，应同为 2
+	v0b, err := copies[0].Recv()
+	assert.NoError(t, err)
+	assert.Equal(t, 2, v0b)
+
+	v1b, err := copies[1].Recv()
+	assert.NoError(t, err)
+	assert.Equal(t, 2, v1b)
+
+	// 均到 EOF
+	_, err = copies[0].Recv()
+	assert.ErrorIs(t, err, io.EOF)
+	_, err = copies[1].Recv()
+	assert.ErrorIs(t, err, io.EOF)
+}
+
+// 变体1：由子1先触发第一次填充，再由子0读取同一位置
+func TestCopyFirstElementChild1First(t *testing.T) {
+	s := newStream[int](0)
+	copies := s.asReader().Copy(2)
+
+	defer func() {
+		for _, cp := range copies {
+			cp.Close()
+		}
+	}()
+
+	go func() {
+		s.send(1, nil)
+		time.Sleep(10 * time.Millisecond)
+		s.send(2, nil)
+		s.closeSend()
+	}()
+
+	// 子1先读到第一个位置
+	v1a, err := copies[1].Recv()
+	assert.NoError(t, err)
+	assert.Equal(t, 1, v1a)
+
+	// 子0随后读同一位置，应也为 1
+	v0a, err := copies[0].Recv()
+	assert.NoError(t, err)
+	assert.Equal(t, 1, v0a)
+
+	// 两者继续读取下一位置，均为 2
+	v1b, err := copies[1].Recv()
+	assert.NoError(t, err)
+	assert.Equal(t, 2, v1b)
+
+	v0b, err := copies[0].Recv()
+	assert.NoError(t, err)
+	assert.Equal(t, 2, v0b)
+
+	// EOF
+	_, err = copies[0].Recv()
+	assert.ErrorIs(t, err, io.EOF)
+	_, err = copies[1].Recv()
+	assert.ErrorIs(t, err, io.EOF)
+}
+
+// 变体2：子0读取首元素后立即关闭，子1继续读到 EOF，且关闭计数正确
+func TestCopyOneChildCloseEarlyOtherContinues(t *testing.T) {
+	s := newStream[int](0)
+	copies := s.asReader().Copy(2)
+
+	// 便于断言 closedNum，这里拿到 parent 引用
+	parent := copies[0].csr.parent
+
+	go func() {
+		s.send(1, nil)
+		s.send(2, nil)
+		s.send(3, nil)
+		s.closeSend()
+	}()
+
+	// 子0读第一个元素后立刻关闭
+	v0a, err := copies[0].Recv()
+	assert.NoError(t, err)
+	assert.Equal(t, 1, v0a)
+	copies[0].Close()
+
+	// 提前关闭不影响子1继续读取完整序列
+	v1a, err := copies[1].Recv()
+	assert.NoError(t, err)
+	assert.Equal(t, 1, v1a)
+
+	v1b, err := copies[1].Recv()
+	assert.NoError(t, err)
+	assert.Equal(t, 2, v1b)
+
+	v1c, err := copies[1].Recv()
+	assert.NoError(t, err)
+	assert.Equal(t, 3, v1c)
+
+	_, err = copies[1].Recv()
+	assert.ErrorIs(t, err, io.EOF)
+
+	// 此时仅一个子关闭
+	assert.Equal(t, 1, int(parent.closedNum))
+
+	// 关闭另一个子后，closedNum==2
+	copies[1].Close()
+	assert.Equal(t, 2, int(parent.closedNum))
+}
+
+// 压力测试：两个子 reader 并发读取大量元素，验证顺序一致且无死锁
+func TestCopyTwoChildrenHighConcurrency(t *testing.T) {
+	s := newStream[int](8)
+	N := 2000
+
+	// 生产者：随机节奏发送 0..N-1
+	go func() {
+		for i := 0; i < N; i++ {
+			// 随机短暂睡眠，制造交错
+			if i%7 == 0 {
+				time.Sleep(time.Microsecond * time.Duration(rand.Intn(200)))
+			}
+			s.send(i, nil)
+		}
+		s.closeSend()
+	}()
+
+	copies := s.asReader().Copy(2)
+	defer func() {
+		for _, cp := range copies {
+			cp.Close()
+		}
+	}()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	consume := func(cp *StreamReader[int]) {
+		defer wg.Done()
+		expect := 0
+		for {
+			// 随机短暂睡眠，模拟不同步的消费节奏
+			if expect%5 == 0 {
+				time.Sleep(time.Microsecond * time.Duration(rand.Intn(200)))
+			}
+			v, err := cp.Recv()
+			if err == io.EOF {
+				break
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, expect, v)
+			expect++
+		}
+		assert.Equal(t, N, expect)
+	}
+
+	go consume(copies[0])
+	go consume(copies[1])
+
+	wg.Wait()
+}
